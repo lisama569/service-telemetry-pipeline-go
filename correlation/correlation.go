@@ -77,19 +77,38 @@ func DefaultValidator(id string) bool {
 	return true
 }
 
+// DefaultMaxActive 判重记录的默认容量上限。
+//
+// 判重只在"当前仍在处理中"的请求之间进行：请求结束（正常或出错）调用
+// Release 后标识即归还，可被后续请求重新继承。因此该记录只随并发在途
+// 请求数增长，不随历史请求增长；容量上限是兜底：在途数异常超过上限时
+// 按登记先后（FIFO）淘汰最旧条目，防止内存无界增长。
+const DefaultMaxActive = 4096
+
 // Tracker 负责标识的生成、继承与传播。
 type Tracker struct {
-	validate Validator
-	mu       sync.Mutex
-	active   map[string]struct{} // 当前进程内活动的 RequestID，用于重复检测
+	validate  Validator
+	maxActive int
+	mu        sync.Mutex
+	active    map[string]struct{} // 当前进程内活动的 RequestID，用于重复检测
+	order     []string            // 登记顺序（FIFO），用于容量淘汰；已 Release 的条目惰性跳过
 }
 
-// NewTracker 创建 Tracker；v 为 nil 时使用 DefaultValidator。
+// NewTracker 创建 Tracker；v 为 nil 时使用 DefaultValidator，
+// 判重记录容量上限为 DefaultMaxActive。
 func NewTracker(v Validator) *Tracker {
+	return NewTrackerWithCapacity(v, DefaultMaxActive)
+}
+
+// NewTrackerWithCapacity 创建指定判重容量上限的 Tracker；maxActive<=0 时使用默认值。
+func NewTrackerWithCapacity(v Validator, maxActive int) *Tracker {
 	if v == nil {
 		v = DefaultValidator
 	}
-	return &Tracker{validate: v, active: make(map[string]struct{})}
+	if maxActive <= 0 {
+		maxActive = DefaultMaxActive
+	}
+	return &Tracker{validate: v, maxActive: maxActive, active: make(map[string]struct{})}
 }
 
 // newID 生成 32 位十六进制随机标识。
@@ -157,11 +176,44 @@ func (t *Tracker) Spawn(ctx context.Context) (context.Context, Context) {
 	return IntoContext(ctx, child), child
 }
 
-// Release 释放一个活动标识，任务结束后调用以便复用检测准确。
+// Release 释放一个活动标识，任务结束（无论正常或出错）后调用：
+// 标识归还可被后续请求重新继承，判重记录也随之收缩。
 func (t *Tracker) Release(requestID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.active, requestID)
+}
+
+// Active 返回当前仍在处理中的标识数量（判重记录大小），用于观测与测试。
+func (t *Tracker) Active() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.active)
+}
+
+// registerLocked 登记标识，必要时按 FIFO 淘汰最旧条目以维持容量上限。
+// 调用方须持有锁。
+func (t *Tracker) registerLocked(id string) {
+	t.active[id] = struct{}{}
+	t.order = append(t.order, id)
+	for len(t.active) > t.maxActive && len(t.order) > 0 {
+		oldest := t.order[0]
+		t.order = t.order[1:]
+		// 已 Release 的条目不在 active 中，惰性跳过。
+		if _, ok := t.active[oldest]; ok {
+			delete(t.active, oldest)
+		}
+	}
+	// order 中积压的已释放条目定期清理，避免切片本身无界增长。
+	if len(t.order) > 4*t.maxActive {
+		kept := t.order[:0]
+		for _, id := range t.order {
+			if _, ok := t.active[id]; ok {
+				kept = append(kept, id)
+			}
+		}
+		t.order = kept
+	}
 }
 
 // mint 生成并登记一个不重复的新标识。
@@ -171,7 +223,7 @@ func (t *Tracker) mint() string {
 	for {
 		id := newID()
 		if _, dup := t.active[id]; !dup {
-			t.active[id] = struct{}{}
+			t.registerLocked(id)
 			return id
 		}
 	}
@@ -184,6 +236,6 @@ func (t *Tracker) tryRegister(id string) bool {
 	if _, dup := t.active[id]; dup {
 		return false
 	}
-	t.active[id] = struct{}{}
+	t.registerLocked(id)
 	return true
 }

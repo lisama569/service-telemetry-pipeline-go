@@ -126,3 +126,38 @@ func TestIDSourceStringDistinct(t *testing.T) {
 	}
 	fmt.Println("来源可区分:", seen)
 }
+
+func TestReleaseAllowsReinherit(t *testing.T) {
+	tr := NewTracker(nil)
+	id := "abcdef0123456789"
+	_, first := tr.Ensure(context.Background(), id)
+	tr.Release(first.RequestID)
+	_, second := tr.Ensure(context.Background(), id)
+	t.Logf("first=%s second=%s 判定依据: 请求结束后标识已归还, 同一上游标识可重新继承", first, second)
+	if second.Source != SourceInherited || second.RequestID != id {
+		t.Fatalf("结束后应能重新继承, 得到 %s", second)
+	}
+	if tr.Active() != 1 {
+		t.Fatalf("判重记录应只含在途请求, active=%d", tr.Active())
+	}
+}
+
+func TestActiveSetCapacityBound(t *testing.T) {
+	tr := NewTrackerWithCapacity(nil, 8)
+	// 不释放地登记大量标识（模拟异常积压），判重记录不得越过上限。
+	for i := 0; i < 100; i++ {
+		id := fmt.Sprintf("%064x", i+1)
+		tr.Ensure(context.Background(), id)
+	}
+	t.Logf("登记 100 个标识不释放, 判重记录 active=%d (上限 8)", tr.Active())
+	if tr.Active() > 8 {
+		t.Fatalf("判重记录超过容量上限: %d > 8", tr.Active())
+	}
+	// 容量淘汰不影响正常释放与再继承。
+	tr.Release(fmt.Sprintf("%064x", 100))
+	_, tc := tr.Ensure(context.Background(), fmt.Sprintf("%064x", 100))
+	t.Logf("correlation=%s 判定依据: 已释放标识可重新继承", tc)
+	if tc.Source != SourceInherited {
+		t.Fatalf("期望 SourceInherited, 得到 %s", tc.Source)
+	}
+}
