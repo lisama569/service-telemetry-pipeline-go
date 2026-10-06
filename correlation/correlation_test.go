@@ -126,3 +126,66 @@ func TestIDSourceStringDistinct(t *testing.T) {
 	}
 	fmt.Println("来源可区分:", seen)
 }
+
+func TestReleaseAllowsReinherit(t *testing.T) {
+	tr := NewTracker(nil)
+	id := "abcdef0123456789"
+	_, first := tr.Ensure(context.Background(), id)
+	t.Logf("first=%s 判定依据: 上游标识合法, 继承", first)
+	tr.Release(first.RequestID)
+	_, second := tr.Ensure(context.Background(), id)
+	t.Logf("second=%s 判定依据: 前一请求已结束并归还标识, 可重新继承", second)
+	if second.Source != SourceInherited || second.RequestID != id {
+		t.Fatalf("归还后应能重新继承, 得到 %s", second)
+	}
+}
+
+func TestInFlightDuplicateStillReplaced(t *testing.T) {
+	tr := NewTracker(nil)
+	id := "abcdef0123456789"
+	_, first := tr.Ensure(context.Background(), id)
+	_, dup := tr.Ensure(context.Background(), id)
+	t.Logf("first=%s dup=%s 判定依据: 标识仍在处理中, 重复须替换", first, dup)
+	if dup.Source != SourceReplacedDuplicate {
+		t.Fatalf("处理中的重复标识应被替换, 得到 %s", dup)
+	}
+	if tr.Active() != 2 {
+		t.Fatalf("两个活动标识都应登记, Active=%d", tr.Active())
+	}
+}
+
+func TestActiveSetBounded(t *testing.T) {
+	tr := NewTracker(nil, WithMaxActive(4))
+	ids := []string{"aaaa0000aaaa0000", "bbbb0000bbbb0000", "cccc0000cccc0000",
+		"dddd0000dddd0000", "eeee0000eeee0000"}
+	for _, id := range ids {
+		tr.Ensure(context.Background(), id)
+	}
+	if tr.Active() != 4 {
+		t.Fatalf("判重记录应受容量上限约束, Active=%d", tr.Active())
+	}
+	// 最旧的 aaaa... 已被淘汰, 可重新继承; 最新的 eeee... 仍在处理中, 仍判重。
+	_, re := tr.Ensure(context.Background(), ids[0])
+	t.Logf("re=%s 判定依据: 最旧记录已被容量上限淘汰, 可重新继承", re)
+	if re.Source != SourceInherited {
+		t.Fatalf("被淘汰的标识应可重新继承, 得到 %s", re)
+	}
+	_, dup := tr.Ensure(context.Background(), ids[4])
+	t.Logf("dup=%s 判定依据: 标识仍在处理中, 判重仍生效", dup)
+	if dup.Source != SourceReplacedDuplicate {
+		t.Fatalf("活动中的标识仍应判重, 得到 %s", dup)
+	}
+}
+
+func TestDeterministicIDFunc(t *testing.T) {
+	seq := 0
+	tr := NewTracker(nil, WithIDFunc(func() string {
+		seq++
+		return fmt.Sprintf("%016x", seq)
+	}))
+	_, tc := tr.Ensure(context.Background(), "")
+	t.Logf("correlation=%s 判定依据: 注入确定性 ID 生成器, 便于复现", tc)
+	if tc.TraceID != "0000000000000001" || tc.RequestID != "0000000000000002" {
+		t.Fatalf("确定性 ID 生成失败: %s", tc)
+	}
+}

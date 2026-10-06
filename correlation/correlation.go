@@ -77,19 +77,61 @@ func DefaultValidator(id string) bool {
 	return true
 }
 
+// DefaultMaxActive 判重记录的默认容量上限。
+//
+// 判重只针对"当前仍在处理中"的标识：任务结束（无论成功或出错）后应调用
+// Release 归还，标识即可被后续请求重新继承。容量上限是为调用方漏调
+// Release 的兜底：超过上限时按登记先后淘汰最旧的记录，保证这份记录
+// 不随历史请求无限增长。
+const DefaultMaxActive = 4096
+
+// Option 定制 Tracker 行为。
+type Option func(*Tracker)
+
+// WithMaxActive 设置判重记录容量上限；n<=0 时使用 DefaultMaxActive。
+func WithMaxActive(n int) Option {
+	return func(t *Tracker) {
+		if n > 0 {
+			t.maxActive = n
+		}
+	}
+}
+
+// WithIDFunc 注入标识生成函数（例如确定性序列），用于可复现的运行报告；
+// 默认使用加密随机。f 必须返回非空且尽量唯一的标识。
+func WithIDFunc(f func() string) Option {
+	return func(t *Tracker) {
+		if f != nil {
+			t.idFunc = f
+		}
+	}
+}
+
 // Tracker 负责标识的生成、继承与传播。
 type Tracker struct {
-	validate Validator
-	mu       sync.Mutex
-	active   map[string]struct{} // 当前进程内活动的 RequestID，用于重复检测
+	validate  Validator
+	idFunc    func() string
+	mu        sync.Mutex
+	active    map[string]struct{} // 当前进程内活动的 RequestID，用于重复检测
+	order     []string            // 登记先后（FIFO），容量超限时淘汰最旧
+	maxActive int
 }
 
 // NewTracker 创建 Tracker；v 为 nil 时使用 DefaultValidator。
-func NewTracker(v Validator) *Tracker {
+func NewTracker(v Validator, opts ...Option) *Tracker {
 	if v == nil {
 		v = DefaultValidator
 	}
-	return &Tracker{validate: v, active: make(map[string]struct{})}
+	t := &Tracker{
+		validate:  v,
+		idFunc:    newID,
+		active:    make(map[string]struct{}),
+		maxActive: DefaultMaxActive,
+	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
 // newID 生成 32 位十六进制随机标识。
@@ -122,7 +164,7 @@ func (t *Tracker) Ensure(ctx context.Context, upstreamID string) (context.Contex
 	if tc, ok := FromContext(ctx); ok {
 		return ctx, tc
 	}
-	tc := Context{TraceID: newID()}
+	tc := Context{TraceID: t.traceID()}
 	switch {
 	case upstreamID == "":
 		tc.RequestID = t.mint()
@@ -157,11 +199,35 @@ func (t *Tracker) Spawn(ctx context.Context) (context.Context, Context) {
 	return IntoContext(ctx, child), child
 }
 
-// Release 释放一个活动标识，任务结束后调用以便复用检测准确。
+// Release 释放一个活动标识，任务结束（无论成功或出错）后调用，
+// 归还后该标识可被后续请求重新继承。
 func (t *Tracker) Release(requestID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if _, ok := t.active[requestID]; !ok {
+		return
+	}
 	delete(t.active, requestID)
+	for i, id := range t.order {
+		if id == requestID {
+			t.order = append(t.order[:i], t.order[i+1:]...)
+			break
+		}
+	}
+}
+
+// Active 返回当前判重记录中的活动标识数，用于观察记录规模。
+func (t *Tracker) Active() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.active)
+}
+
+// traceID 生成链路标识；不登记进判重记录（判重只针对 RequestID）。
+func (t *Tracker) traceID() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.idFunc()
 }
 
 // mint 生成并登记一个不重复的新标识。
@@ -169,9 +235,12 @@ func (t *Tracker) mint() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for {
-		id := newID()
+		id := t.idFunc()
+		if id == "" {
+			continue
+		}
 		if _, dup := t.active[id]; !dup {
-			t.active[id] = struct{}{}
+			t.registerLocked(id)
 			return id
 		}
 	}
@@ -184,6 +253,18 @@ func (t *Tracker) tryRegister(id string) bool {
 	if _, dup := t.active[id]; dup {
 		return false
 	}
-	t.active[id] = struct{}{}
+	t.registerLocked(id)
 	return true
+}
+
+// registerLocked 登记标识并维持容量上限：超限时按登记先后淘汰最旧记录。
+// 调用方必须持有 t.mu。
+func (t *Tracker) registerLocked(id string) {
+	t.active[id] = struct{}{}
+	t.order = append(t.order, id)
+	for len(t.order) > t.maxActive {
+		oldest := t.order[0]
+		t.order = t.order[1:]
+		delete(t.active, oldest)
+	}
 }
